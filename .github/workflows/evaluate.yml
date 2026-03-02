@@ -1,0 +1,105 @@
+name: Scarf Valudate
+
+on:
+  # Make sure that this is refined to be more targetted
+  pull_request:
+
+jobs:
+  # Make sure we discover all the folders first
+  discover:
+    name: Discover Conversion Folders
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - id: set-matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Discover immediate child directories of the checkout root.
+          # This assumes each such directory is a "conversions root" you want to validate.
+          mapfile -t dirs < <(
+            find . -mindepth 1 -maxdepth 1 -type d \
+              ! -name .git \
+              ! -name .github \
+              -print \
+            | sed 's|^\./||' \
+            | sort
+          )
+
+          if [ "${#dirs[@]}" -eq 0 ]; then
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          json=$(printf '%s\n' "${dirs[@]}" \
+            | jq -R . \
+            | jq -s '{include: map({dir: .})}')
+
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+          echo "$json" | jq .
+
+  validate:
+    name: Validate ${{ matrix.dir }}
+    needs: discover
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install scarfbench-cli (GitHub branch v0.1.2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install \
+            --git https://github.com/scarfbench/scarfbench-cli \
+            --branch v0.1.2 \
+            scarfbench-cli
+          scarf --version
+
+      - name: Validate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Adjust this if your benchmark lives elsewhere
+          BENCHMARK_DIR="$GITHUB_WORKSPACE/benchmark"
+
+          if [ ! -d "$BENCHMARK_DIR" ]; then
+            echo "Benchmark directory not found at: $BENCHMARK_DIR" >&2
+            echo "Repo root contents:" >&2
+            ls -la "$GITHUB_WORKSPACE" >&2
+            exit 1
+          fi
+
+          scarf validate \
+            --conversions-dir "$GITHUB_WORKSPACE/${{ matrix.dir }}" \
+            --benchmark-dir "$BENCHMARK_DIR" \
+            --timeout 5
+
+      - name: Docker debug (on failure)
+        if: failure()
+        run: |
+          docker ps -a || true
+          docker images || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.dir }}
+          path: |
+            **/*.log
+            **/validation/**/*
+          if-no-files-found: ignore
